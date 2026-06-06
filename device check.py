@@ -1,2 +1,4 @@
 import sounddevice as sd
-print(sd.query_devices())
+
+if __name__ == "__main__":
+    print(sd.query_devices())

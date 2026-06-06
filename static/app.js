@@ -7,165 +7,139 @@
   const summaryPanel = document.getElementById('summary-panel');
   const summaryText  = document.getElementById('summary-text');
 
-  let running      = false;
-  let paused       = false;
-  let audioCtx     = null;
-  let analyser     = null;
-  let dataArray    = null;
-  let mediaStream  = null;
-  let mediaRecorder = null;
-  let recordChunks  = [];
-  let threshold    = 0.015;
-  let isRecording  = false;
-  let silenceTimer = null;
-  let vadTimer     = null;
-  let recordStart  = 0;
+  let running    = false;
+  let paused     = false;   // true = AI 返答の再生中（PCM 送信を停止）
+  let audioCtx   = null;
+  let mediaStream = null;
+  let workletNode = null;
+  let ws         = null;
 
-  const SILENCE_MS    = 1500;
-  const MIN_RECORD_MS = 500;
+  // 現在ターンのバブル参照
+  let currentUserBubble = null;
+  let currentAiBubble   = null;
+  let currentTurnId     = null;
+
+  // --- 音声再生キュー ---
+  const audioQueue = [];
+  let audioPlaying = false;
+  let streamDone   = false;
 
   function setStatus(text, cls = '') {
     statusEl.textContent = text;
     statusEl.className = cls;
   }
 
-  function addBubble(text, role) {
-    const div = document.createElement('div');
-    div.className = `bubble ${role}`;
-    div.textContent = text;
-    chatEl.appendChild(div);
+  function getOrCreateBubble(id, role) {
+    let el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = id;
+      el.className = `bubble ${role}`;
+      chatEl.appendChild(el);
+    }
     chatEl.scrollTop = chatEl.scrollHeight;
+    return el;
   }
 
-  function getRMS() {
-    analyser.getFloatTimeDomainData(dataArray);
-    let sum = 0;
-    for (let i = 0; i < dataArray.length; i++) sum += dataArray[i] * dataArray[i];
-    return Math.sqrt(sum / dataArray.length);
+  // --- 音声キュー再生 ---
+  function enqueueAudio(b64) {
+    audioQueue.push(b64);
+    if (!audioPlaying) playNext();
   }
 
-  async function calibrate() {
-    setStatus('環境音を計測中...');
-    const samples = [];
-    await new Promise(resolve => {
-      const start = Date.now();
-      const id = setInterval(() => {
-        samples.push(getRMS());
-        if (Date.now() - start >= 1000) {
-          clearInterval(id);
-          resolve();
-        }
-      }, 30);
-    });
-    const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
-    threshold = Math.max(avg * 3, 0.008);
-    console.log('threshold:', threshold);
-    setStatus('待機中');
+  function playNext() {
+    if (audioQueue.length === 0) {
+      audioPlaying = false;
+      checkDone();
+      return;
+    }
+    audioPlaying = true;
+    setStatus('再生中', 'speaking');
+    const b64   = audioQueue.shift();
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const url   = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+    const audio = new Audio(url);
+    audio.onended = () => { URL.revokeObjectURL(url); playNext(); };
+    audio.play();
   }
 
-  function startVAD() {
-    vadTimer = setInterval(() => {
-      if (!running || paused) return;
-
-      const rms = getRMS();
-
-      if (!isRecording) {
-        if (rms > threshold) startRecording();
-      } else {
-        if (rms < threshold) {
-          if (!silenceTimer) {
-            silenceTimer = setTimeout(() => {
-              const duration = Date.now() - recordStart;
-              if (duration >= MIN_RECORD_MS) stopRecording();
-              else cancelRecording();
-            }, SILENCE_MS);
-          }
-        } else {
-          clearTimeout(silenceTimer);
-          silenceTimer = null;
-        }
+  function checkDone() {
+    if (streamDone && !audioPlaying && audioQueue.length === 0) {
+      // 再生完了 → マイク送信再開をサーバへ通知
+      paused = false;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resume' }));
       }
-    }, 30);
-  }
-
-  function startRecording() {
-    recordChunks = [];
-    recordStart  = Date.now();
-    mediaRecorder = new MediaRecorder(mediaStream);
-    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordChunks.push(e.data); };
-    mediaRecorder.onstop = onRecordStop;
-    mediaRecorder.start();
-    isRecording = true;
-    setStatus('聞いています', 'listening');
-  }
-
-  function stopRecording() {
-    clearTimeout(silenceTimer);
-    silenceTimer = null;
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-    isRecording = false;
-  }
-
-  function cancelRecording() {
-    clearTimeout(silenceTimer);
-    silenceTimer = null;
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-    isRecording = false;
-    recordChunks = [];
-    setStatus('待機中');
-  }
-
-  async function onRecordStop() {
-    if (recordChunks.length === 0) { setStatus('待機中'); return; }
-
-    const mimeType = mediaRecorder.mimeType || 'audio/webm';
-    const blob = new Blob(recordChunks, { type: mimeType });
-    recordChunks = [];
-
-    paused = true;
-    setStatus('認識中...', 'processing');
-
-    const ext  = mimeType.includes('ogg') ? '.ogg' : '.webm';
-    const form = new FormData();
-    form.append('audio', blob, `audio${ext}`);
-
-    let data;
-    try {
-      const res = await fetch('/api/converse', { method: 'POST', body: form });
-      data = await res.json();
-    } catch (err) {
-      console.error(err);
-      setStatus('エラー');
-      paused = false;
-      return;
-    }
-
-    if (!data.transcript) {
-      setStatus('待機中');
-      paused = false;
-      return;
-    }
-
-    addBubble(data.transcript, 'user');
-    addBubble(data.reply, 'ai');
-
-    if (data.audio_b64) {
-      setStatus('再生中', 'speaking');
-      const bytes = Uint8Array.from(atob(data.audio_b64), c => c.charCodeAt(0));
-      const url   = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
-      const audio = new Audio(url);
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        paused = false;
-        if (running) setStatus('待機中');
-      };
-      audio.play();
-    } else {
-      paused = false;
       if (running) setStatus('待機中');
     }
   }
 
+  // --- WebSocket メッセージ処理 ---
+  function handleWsMessage(event) {
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+
+    if (data.type === 'transcript_interim') {
+      // 暫定テキスト: 新ターン開始またはバブル上書き
+      if (!currentTurnId) {
+        currentTurnId     = Date.now();
+        currentUserBubble = getOrCreateBubble(`user-${currentTurnId}`, 'user');
+        currentAiBubble   = null;
+        streamDone        = false;
+        audioQueue.length = 0;
+        audioPlaying      = false;
+      }
+      if (currentUserBubble) {
+        currentUserBubble.textContent = data.text;   // 追記ではなく上書き
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+      setStatus('聞いています', 'listening');
+
+    } else if (data.type === 'transcript_final') {
+      // 確定テキスト: バブルを確定表示して次のターン用に参照をリセット
+      if (!currentTurnId) {
+        currentTurnId     = Date.now();
+        currentUserBubble = getOrCreateBubble(`user-${currentTurnId}`, 'user');
+      }
+      if (currentUserBubble) {
+        currentUserBubble.textContent = data.text;
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+      currentUserBubble = null;   // 次の interim は新バブルを作る
+      // LLM 問い合わせ中は録音を止める（AI 返答再生終了後に resume）
+      paused = true;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'pause' }));
+      }
+      setStatus('考え中...', 'processing');
+
+    } else if (data.type === 'reply_delta') {
+      if (!currentTurnId) currentTurnId = Date.now();
+      if (!currentAiBubble) {
+        currentAiBubble = getOrCreateBubble(`ai-${currentTurnId}`, 'ai');
+        setStatus('応答中...', 'processing');
+      }
+      currentAiBubble.textContent += data.text;
+      chatEl.scrollTop = chatEl.scrollHeight;
+
+    } else if (data.type === 'audio') {
+      enqueueAudio(data.b64);
+
+    } else if (data.type === 'done') {
+      streamDone    = true;
+      currentTurnId = null;       // 次のターン準備
+      currentAiBubble = null;
+      checkDone();
+
+    } else if (data.type === 'reset') {
+      chatEl.innerHTML = '';
+
+    } else if (data.type === 'error') {
+      console.error('[server error]', data.message);
+    }
+  }
+
+  // --- 会話開始 ---
   async function startConversation() {
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -174,43 +148,72 @@
       return;
     }
 
-    audioCtx  = new AudioContext();
+    // 16kHz AudioContext（サーバの RealtimeSTT に合わせる）
+    audioCtx = new AudioContext({ sampleRate: 16000 });
     await audioCtx.resume();
 
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 2048;
-    dataArray = new Float32Array(analyser.fftSize);
+    try {
+      await audioCtx.audioWorklet.addModule('/pcm-worklet.js');
+    } catch (e) {
+      console.error('AudioWorklet ロード失敗:', e);
+      alert('AudioWorklet の読み込みに失敗しました。');
+      return;
+    }
 
-    const src = audioCtx.createMediaStreamSource(mediaStream);
-    src.connect(analyser);
+    const source = audioCtx.createMediaStreamSource(mediaStream);
+    workletNode  = new AudioWorkletNode(audioCtx, 'pcm-processor');
+    source.connect(workletNode);
+    // playback 不要なので destination には繋がない
+
+    // WebSocket 接続
+    ws = new WebSocket(`ws://${location.host}/ws/converse`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      // 実際の sampleRate をサーバへ通知（ブラウザが 16kHz を拒否した場合の保険）
+      ws.send(JSON.stringify({ type: 'config', sampleRate: audioCtx.sampleRate }));
+      setStatus('待機中');
+    };
+    ws.onmessage = handleWsMessage;
+    ws.onclose   = () => { if (running) setStatus('切断'); };
+    ws.onerror   = (e) => { console.error('WS エラー:', e); };
+
+    // PCM チャンクを WS へ送出（再生中は停止）
+    workletNode.port.onmessage = (e) => {
+      if (running && !paused && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(e.data);
+      }
+    };
 
     running = true;
     paused  = false;
     btnToggle.textContent = '会話停止';
     btnToggle.classList.add('active');
-
-    await calibrate();
-    startVAD();
+    setStatus('接続中...');
   }
 
+  // --- 会話停止 ---
   function stopConversation() {
     running = false;
     paused  = false;
-    clearInterval(vadTimer);
-    vadTimer = null;
-    if (isRecording) cancelRecording();
+
+    if (ws)          { ws.close(); ws = null; }
+    if (workletNode) { workletNode.disconnect(); workletNode = null; }
     if (audioCtx)    { audioCtx.close(); audioCtx = null; }
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-    analyser  = null;
-    dataArray = null;
+
+    currentUserBubble = null;
+    currentAiBubble   = null;
+    currentTurnId     = null;
+
     btnToggle.textContent = '会話開始';
     btnToggle.classList.remove('active');
     setStatus('待機中');
   }
 
+  // --- ボタン ---
   btnToggle.addEventListener('click', () => {
-    if (!running) startConversation();
-    else stopConversation();
+    if (!running) startConversation(); else stopConversation();
   });
 
   btnSummary.addEventListener('click', async () => {

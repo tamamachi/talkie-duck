@@ -1,9 +1,9 @@
-import tempfile
-import os
+from collections.abc import Generator
 
 import httpx
 import openai
-from faster_whisper import WhisperModel
+
+SENTENCE_ENDINGS = "。．.!?！？\n"
 
 # --- 設定 ---
 WHISPER_USE_GPU = True
@@ -51,33 +51,45 @@ class ConversationHistory:
         return [m["content"] for m in self.messages if m["role"] == "user"]
 
 
-# --- Whisperモデル ---
-def create_whisper_model() -> WhisperModel:
-    if WHISPER_USE_GPU:
-        print("Whisperモデルを読み込んでいます (GPUモード)...")
-        return WhisperModel(
-            "kotoba-tech/kotoba-whisper-v2.0-faster",
-            device="cuda",
-            compute_type="float16",
-        )
-    else:
-        print("Whisperモデルを読み込んでいます (CPUモード)...")
-        return WhisperModel(
-            "kotoba-tech/kotoba-whisper-v2.0-faster",
-            device="cpu",
-            compute_type="int8",
-        )
-
-
-# --- STT ---
-def transcribe(model: WhisperModel, audio_path: str) -> str:
-    segments, _ = model.transcribe(
-        audio_path,
+# --- STT: RealtimeSTT レコーダー ---
+def create_recorder(on_realtime, *, use_microphone: bool = True, input_device_index=None):
+    """
+    RealtimeSTT の AudioToTextRecorder を生成して返す。
+    - on_realtime: 暫定テキスト更新時に呼ばれるコールバック (str) -> None
+    - use_microphone=False の場合は feed_audio() で外部音声を投入する想定
+    - input_device_index: サーバ側マイク利用時のデバイス番号（None でデフォルト）
+    注: デフォルトの realtime_model_type は "tiny"。精度不足なら "small" 等に変更可。
+    """
+    from RealtimeSTT import AudioToTextRecorder
+    return AudioToTextRecorder(
+        model="kotoba-tech/kotoba-whisper-v2.0-faster",
         language="ja",
-        beam_size=5,
-        vad_filter=True,
+        device="cuda" if WHISPER_USE_GPU else "cpu",
+        compute_type="float16" if WHISPER_USE_GPU else "int8",
+        enable_realtime_transcription=True,
+        on_realtime_transcription_update=on_realtime,
+        use_microphone=use_microphone,
+        input_device_index=input_device_index,
+        silero_sensitivity=0.4,
+        webrtc_sensitivity=3,
+        post_speech_silence_duration=1.5,
+        min_length_of_recording=0.5,
+        spinner=False,
     )
-    return "".join(seg.text for seg in segments).strip()
+
+
+# --- 文分割ユーティリティ ---
+def split_complete_sentences(buf: str) -> tuple[list[str], str]:
+    """バッファから完成した文のリストと残りバッファを返す。"""
+    sentences = []
+    last = 0
+    for i, ch in enumerate(buf):
+        if ch in SENTENCE_ENDINGS:
+            s = buf[last:i + 1].strip()
+            if s:
+                sentences.append(s)
+            last = i + 1
+    return sentences, buf[last:]
 
 
 # --- LLM ---
@@ -85,16 +97,23 @@ def make_llm_client() -> openai.OpenAI:
     return openai.OpenAI(base_url=LM_STUDIO_BASE_URL, api_key="lm-studio")
 
 
-def chat_completion(client: openai.OpenAI, history: ConversationHistory, user_text: str) -> str:
+def chat_completion_stream(
+    client: openai.OpenAI, history: ConversationHistory, user_text: str
+) -> Generator[str, None, None]:
     history.add_user(user_text)
+    full_reply = []
     response = client.chat.completions.create(
         model=LM_STUDIO_MODEL,
         messages=history.get_messages(),
         temperature=0.7,
+        stream=True,
     )
-    reply = response.choices[0].message.content
-    history.add_assistant(reply)
-    return reply
+    for chunk in response:
+        if chunk.choices and chunk.choices[0].delta.content:
+            delta = chunk.choices[0].delta.content
+            full_reply.append(delta)
+            yield delta
+    history.add_assistant("".join(full_reply))
 
 
 def summarize_user_utterances(client: openai.OpenAI, history: ConversationHistory) -> str:
