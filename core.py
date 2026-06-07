@@ -124,7 +124,7 @@ def summarize_user_utterances(client: openai.OpenAI, history: ConversationHistor
     messages = [
         {
             "role": "system",
-            "content": "以下は今回ユーザーが話した発言の一覧です。要点を簡潔な日本語でまとめてください。",
+            "content": "以下は今回ユーザーが話した発言の一覧です。要点をまとめて、Markdownのリスト形式に変換して。必要ならネストも使ってください",
         },
         {"role": "user", "content": numbered},
     ]
