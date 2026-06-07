@@ -32,6 +32,24 @@
     statusEl.className = cls;
   }
 
+  // --- 表示中バブルの収集 ---
+  function collectMessages() {
+    // 会話用: 表示順に role 付きメッセージ列（user/.bubble.user, assistant/.bubble.ai）
+    return Array.from(chatEl.querySelectorAll('.bubble'))
+      .map(el => ({
+        role: el.classList.contains('user') ? 'user' : 'assistant',
+        content: el.textContent.trim(),
+      }))
+      .filter(m => m.content);
+  }
+
+  function collectUtterances() {
+    // 要約用: 表示中のユーザー発言テキストだけ
+    return Array.from(chatEl.querySelectorAll('.bubble.user'))
+      .map(el => el.textContent.trim())
+      .filter(Boolean);
+  }
+
   function getOrCreateBubble(id, role) {
     let el = document.getElementById(id);
     if (!el) {
@@ -119,6 +137,8 @@
         paused = true;
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'pause' }));
+          // 確定済みバブルを含む表示中全コンテキストをサーバへ送信
+          ws.send(JSON.stringify({ type: 'generate', messages: collectMessages() }));
         }
         setStatus('考え中...', 'processing');
       }
@@ -244,7 +264,12 @@
   btnSummary.addEventListener('click', async () => {
     btnSummary.disabled = true;
     try {
-      const res  = await fetch('/api/summary', { method: 'POST' });
+      const utterances = collectUtterances();
+      const res  = await fetch('/api/summary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ utterances }),
+      });
       const data = await res.json();
       summaryText.textContent = data.summary;
       summaryPanel.classList.remove('hidden');

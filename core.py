@@ -116,15 +116,32 @@ def chat_completion_stream(
     history.add_assistant("".join(full_reply))
 
 
-def summarize_user_utterances(client: openai.OpenAI, history: ConversationHistory) -> str:
-    utterances = history.user_utterances()
+def chat_stream(
+    client: openai.OpenAI, messages: list[dict]
+) -> Generator[str, None, None]:
+    """システムプロンプト込みの messages をそのまま受け取り LLM をストリーム呼出しする。
+    サーバ永続履歴を使わずクライアント提供のコンテキストだけで動作する版。"""
+    response = client.chat.completions.create(
+        model=LM_STUDIO_MODEL,
+        messages=messages,
+        temperature=0.7,
+        stream=True,
+    )
+    for chunk in response:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+def summarize_utterances(client: openai.OpenAI, utterances: list[str]) -> str:
+    """発話リストを受け取り要点をMarkdownリストで返す。"""
     if not utterances:
         return "まだ発言がありません。"
     numbered = "\n".join(f"{i+1}. {u}" for i, u in enumerate(utterances))
     messages = [
         {
             "role": "system",
-            "content": "以下は今回ユーザーが話した発言の一覧です。要点をまとめて、Markdownのリスト形式に変換して。必要ならネストも使ってください",
+            "content": """以下は今回ユーザーが話した発言の一覧です。要点をまとめて、Markdownのリスト形式に変換して。必要ならネストも使ってください。
+            注意点として、ユーザは音声入力でテキストを作成しているので、音声認識の誤りが混入している可能性があります。そのような部分は文脈からユーザの発言内容を類推して読み替えてください。""",
         },
         {"role": "user", "content": numbered},
     ]
@@ -134,6 +151,11 @@ def summarize_user_utterances(client: openai.OpenAI, history: ConversationHistor
         temperature=0.3,
     )
     return response.choices[0].message.content.strip()
+
+
+def summarize_user_utterances(client: openai.OpenAI, history: ConversationHistory) -> str:
+    """後方互換: ConversationHistory からユーザー発言を取り出して要約する。"""
+    return summarize_utterances(client, history.user_utterances())
 
 
 # --- TTS ---
