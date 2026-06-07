@@ -1,21 +1,21 @@
 import asyncio
 import base64
 import json
+import queue
 import threading
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from core import (
     SYSTEM_PROMPT,
-    ConversationHistory,
     create_recorder,
     make_llm_client,
-    chat_completion_stream,
-    summarize_user_utterances,
+    chat_stream,
+    summarize_utterances,
     voicevox_synthesize,
     split_complete_sentences,
 )
@@ -24,8 +24,6 @@ app = FastAPI()
 
 recorder = None
 llm_client = None
-history = None
-lock = threading.Lock()
 
 # 現在アクティブな WebSocket セッション（単一ユーザー前提）
 active: dict = {"loop": None, "queue": None}
@@ -41,9 +39,8 @@ def _on_realtime(text: str):
 
 @app.on_event("startup")
 def startup():
-    global recorder, llm_client, history
+    global recorder, llm_client
     llm_client = make_llm_client()
-    history = ConversationHistory(SYSTEM_PROMPT)
     print("RealtimeSTT レコーダーを初期化中 (use_microphone=False)...")
     recorder = create_recorder(_on_realtime, use_microphone=False)
     print("起動完了。ブラウザで http://127.0.0.1:8000 を開いてください。")
@@ -63,7 +60,9 @@ async def ws_converse(ws: WebSocket):
     await ws.accept()
     loop = asyncio.get_running_loop()
     out_q: asyncio.Queue = asyncio.Queue()
-    state = {"connected": True, "paused": False, "sample_rate": 16000}
+    # クライアントから generate メッセージを受け取るキュー（worker スレッドで .get() する）
+    gen_q: queue.Queue = queue.Queue()
+    state = {"connected": True, "paused": False, "sample_rate": 16000, "mode": "chat"}
 
     active["loop"] = loop
     active["queue"] = out_q
@@ -90,29 +89,41 @@ async def ws_converse(ws: WebSocket):
             push({"type": "transcript_final", "text": text})
 
             if text.strip() in ("リセット", "最初から", "リセットして"):
-                with lock:
-                    history.clear()
                 push({"type": "reset"})
                 continue
 
+            # 書き起こしモード: LLM/TTS を呼ばずそのまま次の発話へ
+            if state["mode"] == "memo":
+                continue
+
+            # 会話モード: クライアントが送ってくる表示中コンテキストを待つ
             try:
-                with lock:
-                    buf = ""
-                    for delta in chat_completion_stream(llm_client, history, text):
-                        push({"type": "reply_delta", "text": delta})
-                        buf += delta
-                        sents, buf = split_complete_sentences(buf)
-                        for s in sents:
-                            try:
-                                push({"type": "audio", "b64": _b64(voicevox_synthesize(s))})
-                            except Exception as e:
-                                push({"type": "error", "message": str(e)})
-                    buf = buf.strip()
-                    if buf:
+                messages = gen_q.get()      # {"type":"generate","messages":[...]} のメッセージ列
+            except Exception:
+                break
+            if messages is None or not state["connected"]:
+                break
+
+            # system プロンプトを先頭に付けて LLM 呼出し
+            full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+
+            try:
+                buf = ""
+                for delta in chat_stream(llm_client, full_messages):
+                    push({"type": "reply_delta", "text": delta})
+                    buf += delta
+                    sents, buf = split_complete_sentences(buf)
+                    for s in sents:
                         try:
-                            push({"type": "audio", "b64": _b64(voicevox_synthesize(buf))})
+                            push({"type": "audio", "b64": _b64(voicevox_synthesize(s))})
                         except Exception as e:
                             push({"type": "error", "message": str(e)})
+                buf = buf.strip()
+                if buf:
+                    try:
+                        push({"type": "audio", "b64": _b64(voicevox_synthesize(buf))})
+                    except Exception as e:
+                        push({"type": "error", "message": str(e)})
                 push({"type": "done"})
             except Exception as e:
                 push({"type": "error", "message": str(e)})
@@ -160,11 +171,15 @@ async def ws_converse(ws: WebSocket):
                     t = ctrl.get("type")
                     if t == "config":
                         state["sample_rate"] = int(ctrl.get("sampleRate", 16000))
+                        state["mode"] = ctrl.get("mode", "chat")
                     elif t == "pause":
                         state["paused"] = True
                     elif t == "resume":
                         state["paused"] = False
                         recorder.clear_audio_queue()            # 残留音声を破棄
+                    elif t == "generate":
+                        # クライアントが送ってきた表示中会話コンテキスト
+                        gen_q.put_nowait(ctrl.get("messages", []))
                 except Exception:
                     pass
     except Exception:
@@ -177,21 +192,22 @@ async def ws_converse(ws: WebSocket):
             recorder.abort()                                    # recorder.text() のブロック解除
         except Exception:
             pass
+        gen_q.put_nowait(None)                                  # worker の gen_q.get() を解除
         out_q.put_nowait(None)                                  # sender タスクを終了
         await sender_task
 
 
 @app.post("/api/summary")
-def summary():
-    with lock:
-        text = summarize_user_utterances(llm_client, history)
+async def summary(req: Request):
+    body = await req.json()
+    utterances = [u for u in body.get("utterances", []) if u and u.strip()]
+    text = summarize_utterances(llm_client, utterances)
     return JSONResponse({"summary": text})
 
 
 @app.post("/api/reset")
 def reset():
-    with lock:
-        history.clear()
+    # サーバ側に永続履歴は無いので no-op。画面クリアはクライアント側で行う。
     return JSONResponse({"ok": True})
 
 
