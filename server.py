@@ -63,7 +63,7 @@ async def ws_converse(ws: WebSocket):
     await ws.accept()
     loop = asyncio.get_running_loop()
     out_q: asyncio.Queue = asyncio.Queue()
-    state = {"connected": True, "paused": False, "sample_rate": 16000}
+    state = {"connected": True, "paused": False, "sample_rate": 16000, "mode": "chat"}
 
     active["loop"] = loop
     active["queue"] = out_q
@@ -93,6 +93,12 @@ async def ws_converse(ws: WebSocket):
                 with lock:
                     history.clear()
                 push({"type": "reset"})
+                continue
+
+            # メモモード: LLM/TTSを呼ばず発言を記録するだけ
+            if state["mode"] == "memo":
+                with lock:
+                    history.add_user(text)
                 continue
 
             try:
@@ -160,6 +166,7 @@ async def ws_converse(ws: WebSocket):
                     t = ctrl.get("type")
                     if t == "config":
                         state["sample_rate"] = int(ctrl.get("sampleRate", 16000))
+                        state["mode"] = ctrl.get("mode", "chat")
                     elif t == "pause":
                         state["paused"] = True
                     elif t == "resume":

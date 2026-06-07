@@ -6,7 +6,10 @@
   const chatEl       = document.getElementById('chat');
   const summaryPanel = document.getElementById('summary-panel');
   const summaryText  = document.getElementById('summary-text');
+  const btnModeChat  = document.getElementById('mode-chat');
+  const btnModeMemo  = document.getElementById('mode-memo');
 
+  let mode    = 'chat';   // 'chat' | 'memo'
   let running    = false;
   let paused     = false;   // true = AI 返答の再生中（PCM 送信を停止）
   let audioCtx   = null;
@@ -106,12 +109,19 @@
         chatEl.scrollTop = chatEl.scrollHeight;
       }
       currentUserBubble = null;   // 次の interim は新バブルを作る
-      // LLM 問い合わせ中は録音を止める（AI 返答再生終了後に resume）
-      paused = true;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'pause' }));
+
+      if (mode === 'memo') {
+        currentTurnId = null;   // メモモード: done が来ないのでここでリセット
+        // メモモード: LLM待ちなし。マイクを止めず連続発話できる
+        setStatus('待機中');
+      } else {
+        // 会話モード: LLM 問い合わせ中は録音を止める（AI 返答再生終了後に resume）
+        paused = true;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'pause' }));
+        }
+        setStatus('考え中...', 'processing');
       }
-      setStatus('考え中...', 'processing');
 
     } else if (data.type === 'reply_delta') {
       if (!currentTurnId) currentTurnId = Date.now();
@@ -170,8 +180,8 @@
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
-      // 実際の sampleRate をサーバへ通知（ブラウザが 16kHz を拒否した場合の保険）
-      ws.send(JSON.stringify({ type: 'config', sampleRate: audioCtx.sampleRate }));
+      // 実際の sampleRate とモードをサーバへ通知
+      ws.send(JSON.stringify({ type: 'config', sampleRate: audioCtx.sampleRate, mode }));
       setStatus('待機中');
     };
     ws.onmessage = handleWsMessage;
@@ -187,8 +197,10 @@
 
     running = true;
     paused  = false;
-    btnToggle.textContent = '会話停止';
+    btnToggle.textContent = mode === 'memo' ? 'メモ停止' : '会話停止';
     btnToggle.classList.add('active');
+    btnModeChat.disabled = true;
+    btnModeMemo.disabled = true;
     setStatus('接続中...');
   }
 
@@ -206,8 +218,10 @@
     currentAiBubble   = null;
     currentTurnId     = null;
 
-    btnToggle.textContent = '会話開始';
+    btnToggle.textContent = mode === 'memo' ? 'メモ開始' : '会話開始';
     btnToggle.classList.remove('active');
+    btnModeChat.disabled = false;
+    btnModeMemo.disabled = false;
     setStatus('待機中');
   }
 
@@ -215,6 +229,17 @@
   btnToggle.addEventListener('click', () => {
     if (!running) startConversation(); else stopConversation();
   });
+
+  function setMode(m) {
+    mode = m;
+    btnModeChat.classList.toggle('active', m === 'chat');
+    btnModeMemo.classList.toggle('active', m === 'memo');
+    if (!running) {
+      btnToggle.textContent = m === 'memo' ? 'メモ開始' : '会話開始';
+    }
+  }
+  btnModeChat.addEventListener('click', () => setMode('chat'));
+  btnModeMemo.addEventListener('click', () => setMode('memo'));
 
   btnSummary.addEventListener('click', async () => {
     btnSummary.disabled = true;
