@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Talkie</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Talkie</h1>
+      <div id="status">待機中</div>
+    </header>
+
+    <div id="summary-panel" class="hidden">
+      <div id="summary-title">会話の概要</div>
+      <div id="summary-text"></div>
+    </div>
+
+    <div id="chat"></div>
+
+    <footer>
+      <button id="btn-toggle" class="btn-primary">会話開始</button>
+      <button id="btn-summary" class="btn-secondary">概要をまとめる</button>
+      <button id="btn-reset" class="btn-ghost">リセット</button>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
