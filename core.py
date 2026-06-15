@@ -5,6 +5,12 @@ import openai
 
 SENTENCE_ENDINGS = "。．.!?！？\n"
 
+# Whisper が無音時などに幻覚出力する既知フレーズ
+STT_HALLUCINATIONS = frozenset({
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございました。",
+})
+
 # --- 設定 ---
 WHISPER_USE_GPU = True
 

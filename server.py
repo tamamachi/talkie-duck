@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from core import (
     SYSTEM_PROMPT,
+    STT_HALLUCINATIONS,
     create_recorder,
     make_llm_client,
     chat_stream,
@@ -85,10 +86,12 @@ async def ws_converse(ws: WebSocket):
                 break
             if not text or not text.strip():
                 continue
+            if text.strip() in STT_HALLUCINATIONS:
+                continue
 
             push({"type": "transcript_final", "text": text})
 
-            if text.strip() in ("リセット", "最初から", "リセットして"):
+            if text.strip(" .") in ("リセット", "最初から", "リセットして"):
                 push({"type": "reset"})
                 continue
 
